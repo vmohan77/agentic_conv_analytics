@@ -23,3 +23,14 @@ User Query (Natural Language)
 [Database] (SQL Execution)
     ↓
 Results (Tabular Format)
+
+
+### Key Components
+
+- **`agent_lgs.py`** - Main LangGraph agent orchestrating the entire workflow
+- **`mcp_server.py`** - MCP server exposing tools for schema retrieval, SQL validation, and execution
+- **`claude_api.py`** - Claude API initialization and configuration
+- **`mcp_client.py`** - MCP client for tool registration
+- **`build_rag.py`** - RAG setup with ChromaDB for semantic schema search
+- **`retail_schema_documentation.txt`** - Database schema definitions
+- **`chroma_db/`** - Persistent ChromaDB vector store
