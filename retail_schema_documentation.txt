@@ -1,0 +1,879 @@
+================================================================================
+RETAIL DATA PLATFORM — TABLE CATALOGUE
+================================================================================
+Schema:          retail
+Owner:           Data Platform Engineering
+Last Reviewed:   June 2026
+Classification:  Internal — Business Sensitive
+================================================================================
+
+
+================================================================================
+TABLE: product_categories
+================================================================================
+
+SEMANTIC DESCRIPTION
+--------------------
+The root reference entity for the product taxonomy. Defines the hierarchical
+classification structure — department (L1), category (L2), sub-category (L3) —
+used across merchandising, inventory, and analytics. Self-referencing via
+par_cat_cd to support multi-level nesting. Every product must belong to exactly
+one leaf-level (L3) category. Maintained by the Merchandising team via the PIM
+system. Changes to L1 nodes have broad downstream impact across dbt models and
+dashboards and must follow the Schema Change Request process. Filter on
+cat_sts_cd = 'I' to exclude retired categories from active queries.
+
+UPSTREAM DEPENDENCIES: None (seed/reference table from PIM system)
+DOWNSTREAM CONSUMERS:  products, all product-level dbt mart models,
+                       category performance dashboards,
+                       promotional targeting pipelines
+
+GRAIN: One row per category node. A category may be a parent (has children),
+a leaf (directly assigned to products), or both at intermediate levels.
+
+COLUMN DEFINITIONS
+------------------
+Column          : cat_cd
+Data Type       : VARCHAR(50)
+Nullable        : NOT NULL
+Key             : PRIMARY KEY
+Description     : Unique category code used as the primary identifier across
+                  all product and reporting systems. Values follow a structured
+                  naming convention e.g. ELEC, ELEC_AUDIO, ELEC_AUDIO_HDPHN.
+
+Column          : cat_nm
+Data Type       : VARCHAR(100)
+Nullable        : NOT NULL
+Key             : -
+Description     : Human-readable category display name shown in merchandising
+                  UIs and reports.
+
+Column          : par_cat_cd
+Data Type       : VARCHAR(50)
+Nullable        : NULL
+Key             : FOREIGN KEY -> product_categories.cat_cd (self-referencing)
+Description     : Parent category code for hierarchy traversal. NULL indicates
+                  a top-level department node (L1). Consumers must not assume
+                  leaf-level when joining to products — always filter on
+                  cat_lvl_num = 3 for leaf categories.
+
+Column          : cat_lvl_num
+Data Type       : SMALLINT
+Nullable        : NOT NULL
+Key             : -
+Description     : Hierarchy depth. 1 = department, 2 = category,
+                  3 = sub-category (leaf). Only L3 nodes are directly
+                  assignable to products.
+
+Column          : cat_sts_cd
+Data Type       : CHAR(1)
+Nullable        : NOT NULL
+Key             : -
+Description     : Lifecycle status of the category node. A = Active,
+                  I = Inactive (retired, preserved for historical integrity).
+                  Exclude I from all active merchandising and analytics queries.
+
+Column          : upd_dt_utc
+Data Type       : TIMESTAMP
+Nullable        : NOT NULL
+Key             : -
+Description     : Timestamp of the last modification to this record, in UTC.
+                  Set by the PIM system on every update event.
+
+
+================================================================================
+TABLE: products
+================================================================================
+
+SEMANTIC DESCRIPTION
+--------------------
+The master product catalogue representing every SKU that is or has been
+available for sale across all channels. Each row is a single sellable unit with
+its classification, current list price, and lifecycle status. The authoritative
+source for product identity across the platform. Note that unit_prc_amt reflects
+the current list price maintained by the Pricing team — it is not the price
+charged to a customer. Actual sold price is captured at transaction time in
+order_items.unit_sell_prc_amt and must always be used for revenue calculations.
+Discontinued products (prd_sts_cd = 'D') are retained for referential integrity
+with historical order and return records.
+
+UPSTREAM DEPENDENCIES: product_categories
+DOWNSTREAM CONSUMERS:  order_items, product_inventory, return_items,
+                       product performance dbt models,
+                       recommendation ML feature store
+
+GRAIN: One row per product SKU. Historical price changes are not stored here —
+tracked in product_price_history audit table.
+
+COLUMN DEFINITIONS
+------------------
+Column          : prd_id
+Data Type       : UUID
+Nullable        : NOT NULL
+Key             : PRIMARY KEY
+Description     : System-generated unique identifier for the product SKU.
+                  Immutable once assigned. Used as the foreign key reference
+                  across order_items, product_inventory, and return_items.
+
+Column          : prd_nm
+Data Type       : VARCHAR(200)
+Nullable        : NOT NULL
+Key             : -
+Description     : Full product display name as shown in the storefront and
+                  order confirmations. Sourced from the PIM system.
+
+Column          : cat_cd
+Data Type       : VARCHAR(50)
+Nullable        : NOT NULL
+Key             : FOREIGN KEY -> product_categories.cat_cd
+Description     : Leaf-level category assignment for this product. Must
+                  reference a cat_lvl_num = 3 node. Drives category-level
+                  revenue aggregation and promotional eligibility.
+
+Column          : prd_sts_cd
+Data Type       : CHAR(1)
+Nullable        : NOT NULL
+Key             : -
+Description     : Product lifecycle status. A = Active (available for sale),
+                  D = Discontinued (no longer sold, retained for history),
+                  S = Seasonal (temporarily unavailable). Filter to A or A+S
+                  for availability queries.
+
+Column          : unit_prc_amt
+Data Type       : DECIMAL(10,2)
+Nullable        : NOT NULL
+Key             : -
+Description     : Current list price in INR. Reflects the Pricing team's
+                  latest price event. Do NOT use for revenue aggregation —
+                  use order_items.unit_sell_prc_amt for actual sold price.
+
+Column          : crt_dt_utc
+Data Type       : TIMESTAMP
+Nullable        : NOT NULL
+Key             : -
+Description     : UTC timestamp when this product record was first created
+                  in the catalogue system.
+
+
+================================================================================
+TABLE: product_inventory
+================================================================================
+
+SEMANTIC DESCRIPTION
+--------------------
+The operational inventory ledger tracking real-time stock position for each
+product at each warehouse location. Updated by the Warehouse Management System
+(WMS) on every inbound receipt, outbound pick, reservation, and stock adjustment
+event. The two quantity fields must be read together: qty_on_hnd_num is the
+physical count, qty_rsv_num is committed to pending orders but not yet
+dispatched. True available-to-promise is always qty_on_hnd_num - qty_rsv_num.
+Consumers reporting only on qty_on_hnd_num will overstate available stock.
+A product stocked at multiple warehouses has one row per location; national stock
+position requires aggregation across wh_loc_cd. Negative values in
+qty_on_hnd_num are possible under high-velocity conditions due to WMS eventual
+consistency — treat as zero in customer-facing queries.
+
+UPSTREAM DEPENDENCIES: products
+DOWNSTREAM CONSUMERS:  fulfilment system, supply chain replenishment pipeline,
+                       inventory availability dbt models
+
+GRAIN: One row per product per warehouse location.
+
+COLUMN DEFINITIONS
+------------------
+Column          : inv_id
+Data Type       : UUID
+Nullable        : NOT NULL
+Key             : PRIMARY KEY
+Description     : System-generated unique identifier for this inventory
+                  position record.
+
+Column          : prd_id
+Data Type       : UUID
+Nullable        : NOT NULL
+Key             : FOREIGN KEY -> products.prd_id
+Description     : Product whose stock position this row describes. A product
+                  with multi-warehouse stock has one row per wh_loc_cd.
+
+Column          : wh_loc_cd
+Data Type       : VARCHAR(20)
+Nullable        : NOT NULL
+Key             : -
+Description     : Warehouse location code identifying the physical fulfilment
+                  centre. e.g. BLR_WH1, DEL_WH2. Sourced from the WMS
+                  location master.
+
+Column          : qty_on_hnd_num
+Data Type       : INT
+Nullable        : NOT NULL
+Key             : -
+Description     : Gross physical quantity currently in the warehouse. Does not
+                  account for reservations. Use qty_on_hnd_num - qty_rsv_num
+                  for true available-to-promise. May transiently be negative
+                  under WMS eventual consistency — treat as zero in
+                  availability logic.
+
+Column          : qty_rsv_num
+Data Type       : INT
+Nullable        : NOT NULL
+Key             : -
+Description     : Quantity already reserved against confirmed orders pending
+                  dispatch. Subtracted from qty_on_hnd_num to derive
+                  available stock.
+
+Column          : lst_stk_dt_utc
+Data Type       : TIMESTAMP
+Nullable        : NOT NULL
+Key             : -
+Description     : UTC timestamp of the most recent stock count or WMS
+                  adjustment event for this product-location combination.
+
+
+================================================================================
+TABLE: customers
+================================================================================
+
+SEMANTIC DESCRIPTION
+--------------------
+The master customer identity table representing every registered account on the
+platform, including live customers, churned customers, and internal test
+accounts. Contains PII — cust_email_addr is classified as personally
+identifiable and must not be exposed in shared analytics environments without
+masking. The is_tst_acct_flg column is the most critical filter in the schema:
+all analytics queries, revenue reports, and ML training pipelines must include
+WHERE is_tst_acct_flg = FALSE to exclude internal and QA accounts. Failure to
+apply this filter is the single most common cause of inflated revenue and order
+count metrics across the platform. cust_tier_cd is computed nightly by the
+Loyalty dbt model based on rolling 12-month spend and is the authoritative
+tier reference.
+
+UPSTREAM DEPENDENCIES: None (source of record from identity/auth system)
+DOWNSTREAM CONSUMERS:  orders, checkout_sessions, returns,
+                       customer lifetime value dbt models,
+                       loyalty programme pipeline, CRM sync
+
+GRAIN: One row per registered customer account. Unique on cust_email_addr.
+
+COLUMN DEFINITIONS
+------------------
+Column          : cust_id
+Data Type       : UUID
+Nullable        : NOT NULL
+Key             : PRIMARY KEY
+Description     : System-generated unique customer identifier. Immutable once
+                  assigned at registration. Referenced by orders,
+                  checkout_sessions, and returns.
+
+Column          : cust_email_addr
+Data Type       : VARCHAR(254)
+Nullable        : NOT NULL
+Key             : UNIQUE
+Description     : Customer's registered email address. PII — mask in
+                  non-production environments. Unique constraint enforces
+                  one account per email. Accounts with domain @test.retailco.in
+                  or @qa.retailco.in are always flagged is_tst_acct_flg = TRUE.
+
+Column          : cust_rgn_cd
+Data Type       : VARCHAR(10)
+Nullable        : NOT NULL
+Key             : -
+Description     : Geographic region of the customer's registered delivery
+                  address. Values: SOUTH, NORTH, EAST, WEST, CENTRAL.
+                  Derived from pincode at registration. Used for regional
+                  revenue reporting.
+
+Column          : cust_tier_cd
+Data Type       : VARCHAR(10)
+Nullable        : NOT NULL
+Key             : -
+Description     : Loyalty programme tier. Values: BRONZE, SILVER, GOLD,
+                  PLATINUM. Computed nightly by the loyalty_tier dbt model
+                  from rolling 12-month net spend. Do not recompute inline —
+                  use this column as the authoritative tier.
+
+Column          : acct_crt_dt_utc
+Data Type       : TIMESTAMP
+Nullable        : NOT NULL
+Key             : -
+Description     : UTC timestamp of account creation. Used for cohort analysis
+                  and customer tenure calculations.
+
+Column          : is_tst_acct_flg
+Data Type       : BOOLEAN
+Nullable        : NOT NULL
+Key             : -
+Description     : Identifies internal QA and load-test accounts.
+                  TRUE = test account. MUST be filtered as FALSE in every
+                  analytics query, revenue report, and ML training pipeline.
+                  This is the most critical mandatory filter in the schema.
+
+
+================================================================================
+TABLE: orders
+================================================================================
+
+SEMANTIC DESCRIPTION
+--------------------
+The central transactional entity capturing every customer order placed across
+all sales channels. Each row represents a single order header — the parent
+record to one or more order_items rows that carry the line-level detail.
+tot_ord_amt is the gross order value inclusive of tax and after basket-level
+discounts; it is the correct field for order-level GMV reporting. Line-level
+revenue requires joining to order_items. Orders in PENDING status have not yet
+been payment-confirmed and must be excluded from confirmed revenue metrics.
+The chnl_cd field is the primary dimension for channel mix analysis. Orders are
+immutable once in DELIVERED or CANCELLED status — any post-delivery financial
+adjustment is handled via the returns table.
+
+UPSTREAM DEPENDENCIES: customers
+DOWNSTREAM CONSUMERS:  order_items, returns, checkout_sessions (via ord_id),
+                       GMV dbt models, order fulfilment pipeline,
+                       finance reconciliation jobs
+
+GRAIN: One row per order. An order has exactly one customer and one or more
+order_items lines.
+
+COLUMN DEFINITIONS
+------------------
+Column          : ord_id
+Data Type       : UUID
+Nullable        : NOT NULL
+Key             : PRIMARY KEY
+Description     : System-generated unique order identifier. Referenced by
+                  order_items, returns, and checkout_sessions.
+
+Column          : cust_ref_id
+Data Type       : UUID
+Nullable        : NOT NULL
+Key             : FOREIGN KEY -> customers.cust_id
+Description     : Customer who placed this order. Always join with
+                  is_tst_acct_flg = FALSE to exclude test accounts
+                  from analytics.
+
+Column          : ord_sts_cd
+Data Type       : VARCHAR(20)
+Nullable        : NOT NULL
+Key             : -
+Description     : Current order lifecycle status. Values: PENDING (awaiting
+                  payment), CONFIRMED (payment successful), SHIPPED
+                  (dispatched from warehouse), DELIVERED (received by
+                  customer), CANCELLED (voided before dispatch). Exclude
+                  PENDING and CANCELLED from revenue calculations.
+
+Column          : ord_plcd_dt_utc
+Data Type       : TIMESTAMP
+Nullable        : NOT NULL
+Key             : -
+Description     : UTC timestamp when the customer submitted the order. Use
+                  for all time-series order volume analysis. This is not the
+                  payment timestamp — see payments.pmt_dt_utc for payment
+                  time.
+
+Column          : tot_ord_amt
+Data Type       : DECIMAL(12,2)
+Nullable        : NOT NULL
+Key             : -
+Description     : Gross order value in INR inclusive of tax and basket-level
+                  discounts. Use for order-level GMV. For line-level revenue
+                  net of item discounts, aggregate from
+                  order_items.unit_sell_prc_amt x qty_ord_num.
+
+Column          : chnl_cd
+Data Type       : VARCHAR(20)
+Nullable        : NOT NULL
+Key             : -
+Description     : Sales channel through which the order was placed. Values:
+                  WEB (desktop browser), APP (mobile application), STORE
+                  (in-store POS), API (B2B or partner integration). Primary
+                  dimension for channel mix and attribution reporting.
+
+
+================================================================================
+TABLE: order_items
+================================================================================
+
+SEMANTIC DESCRIPTION
+--------------------
+The order line-item table storing one row per product per order. Child of
+orders — every row must have a valid parent order. This is the grain-level
+source of truth for units sold, sold price, and discount applied, and is the
+correct table for all SKU-level and category-level revenue analysis.
+unit_sell_prc_amt captures the price actually charged at the time of purchase
+and may differ from the current products.unit_prc_amt due to promotions, price
+changes, or negotiated rates. disc_pct is the line-level discount applied on
+top of any basket-level discount reflected in orders.tot_ord_amt. Both fields
+are required to reconcile line revenue to order total.
+
+UPSTREAM DEPENDENCIES: orders, products
+DOWNSTREAM CONSUMERS:  return_items, SKU-level revenue dbt models,
+                       product performance dashboards,
+                       recommendation ML feature store,
+                       category margin analysis
+
+GRAIN: One row per product per order. A single order purchasing the same
+product twice in separate line entries will have two rows.
+
+COLUMN DEFINITIONS
+------------------
+Column          : ord_itm_id
+Data Type       : UUID
+Nullable        : NOT NULL
+Key             : PRIMARY KEY
+Description     : System-generated unique identifier for this order line.
+                  Referenced by return_items for return-to-original-line
+                  traceability.
+
+Column          : ord_id
+Data Type       : UUID
+Nullable        : NOT NULL
+Key             : FOREIGN KEY -> orders.ord_id
+Description     : Parent order for this line. Every order_items row must
+                  have a corresponding orders row.
+
+Column          : prd_id
+Data Type       : UUID
+Nullable        : NOT NULL
+Key             : FOREIGN KEY -> products.prd_id
+Description     : Product purchased on this line. Join to products for name,
+                  category, and current price. Note prd_id may reference a
+                  Discontinued product for historical orders.
+
+Column          : qty_ord_num
+Data Type       : INT
+Nullable        : NOT NULL
+Key             : -
+Description     : Quantity of this product ordered on this line. Minimum
+                  value 1. Used as the multiplier for revenue and
+                  units-sold calculations.
+
+Column          : unit_sell_prc_amt
+Data Type       : DECIMAL(10,2)
+Nullable        : NOT NULL
+Key             : -
+Description     : Actual per-unit price charged to the customer at time of
+                  order in INR. Reflects promotions and negotiated rates
+                  active at purchase time. This is the correct field for
+                  revenue calculations — do NOT use products.unit_prc_amt.
+                  Net line revenue = unit_sell_prc_amt x qty_ord_num x
+                  (1 - disc_pct / 100).
+
+Column          : disc_pct
+Data Type       : DECIMAL(5,2)
+Nullable        : NOT NULL
+Key             : -
+Description     : Line-level discount percentage applied to this item.
+                  Value between 0.00 and 100.00. A value of 0.00 means
+                  no line discount was applied. Applied in addition to any
+                  basket-level discount in orders.tot_ord_amt.
+
+
+================================================================================
+TABLE: checkout_sessions
+================================================================================
+
+SEMANTIC DESCRIPTION
+--------------------
+Captures every checkout session initiated by a customer regardless of whether
+it resulted in a completed order. Each row represents a single checkout attempt
+from session initiation through to completion, abandonment, or expiry. This
+table is the primary source for conversion funnel analysis — the ratio of
+COMPLETED to total non-EXPIRED sessions is the platform checkout conversion
+rate. Sessions in ABANDONED status are the target population for cart recovery
+campaigns. The ord_id column is null until a session reaches COMPLETED status;
+consumers must handle the null case and not assume a session always produces
+an order.
+
+UPSTREAM DEPENDENCIES: customers
+DOWNSTREAM CONSUMERS:  payments, conversion funnel dbt models,
+                       cart abandonment marketing pipeline,
+                       checkout performance dashboards
+
+GRAIN: One row per checkout session. A customer may have multiple sessions
+(e.g. multiple abandoned attempts before a successful purchase).
+
+COLUMN DEFINITIONS
+------------------
+Column          : sess_id
+Data Type       : UUID
+Nullable        : NOT NULL
+Key             : PRIMARY KEY
+Description     : System-generated unique identifier for this checkout
+                  session. Referenced by payments as the parent entity.
+
+Column          : cust_ref_id
+Data Type       : UUID
+Nullable        : NOT NULL
+Key             : FOREIGN KEY -> customers.cust_id
+Description     : Customer who initiated this checkout session. Apply
+                  is_tst_acct_flg = FALSE filter when using for
+                  conversion analytics.
+
+Column          : sess_sts_cd
+Data Type       : VARCHAR(20)
+Nullable        : NOT NULL
+Key             : -
+Description     : Session lifecycle status. Values: ACTIVE (in progress),
+                  COMPLETED (order placed successfully), ABANDONED (customer
+                  exited without completing), EXPIRED (session timed out
+                  after 30 minutes of inactivity).
+
+Column          : sess_strt_dt_utc
+Data Type       : TIMESTAMP
+Nullable        : NOT NULL
+Key             : -
+Description     : UTC timestamp when the customer entered the checkout flow.
+                  Use with sess_sts_cd for time-to-complete and abandonment
+                  duration analysis.
+
+Column          : tot_bskt_amt
+Data Type       : DECIMAL(12,2)
+Nullable        : NOT NULL
+Key             : -
+Description     : Total basket value in INR at the moment the checkout
+                  session was initiated. Reflects item prices and quantities
+                  at cart time. May differ from orders.tot_ord_amt if the
+                  customer modified the basket during checkout.
+
+Column          : ord_id
+Data Type       : UUID
+Nullable        : NULL
+Key             : FOREIGN KEY -> orders.ord_id
+Description     : Reference to the order created when this session reached
+                  COMPLETED status. NULL for all non-COMPLETED sessions.
+                  Always handle the null case in joins — never assume
+                  this column is populated.
+
+
+================================================================================
+TABLE: payments
+================================================================================
+
+SEMANTIC DESCRIPTION
+--------------------
+Records every payment transaction attempt associated with a checkout session.
+Child of checkout_sessions. A single checkout session may have multiple payment
+rows if the customer retried after a failed attempt or split payment across
+methods. Only rows with pmt_sts_cd = 'SUCCESS' represent confirmed revenue —
+FAILED rows must be excluded from financial reporting. REFUNDED rows represent
+payments reversed following an approved return and should be included in net
+revenue calculations. The pmt_mthd_cd dimension is the primary field for payment
+method mix reporting used by the Finance and Payments product teams to track
+UPI adoption, COD reduction, and BNPL eligibility.
+
+UPSTREAM DEPENDENCIES: checkout_sessions
+DOWNSTREAM CONSUMERS:  finance reconciliation dbt models,
+                       payment method mix dashboards,
+                       fraud detection pipeline,
+                       refund processing jobs
+
+GRAIN: One row per payment transaction attempt. A session with retries has
+multiple rows; only SUCCESS rows contribute to confirmed revenue.
+
+COLUMN DEFINITIONS
+------------------
+Column          : pmt_id
+Data Type       : UUID
+Nullable        : NOT NULL
+Key             : PRIMARY KEY
+Description     : System-generated unique identifier for this payment
+                  transaction attempt.
+
+Column          : sess_id
+Data Type       : UUID
+Nullable        : NOT NULL
+Key             : FOREIGN KEY -> checkout_sessions.sess_id
+Description     : Parent checkout session this payment belongs to. A session
+                  may have multiple payment rows across retry attempts or
+                  split-payment scenarios.
+
+Column          : pmt_mthd_cd
+Data Type       : VARCHAR(20)
+Nullable        : NOT NULL
+Key             : -
+Description     : Payment instrument used. Values: UPI, CARD, NETBANKING,
+                  WALLET, COD (cash on delivery). Primary dimension for
+                  payment mix analysis and fraud pattern detection.
+
+Column          : pmt_sts_cd
+Data Type       : VARCHAR(20)
+Nullable        : NOT NULL
+Key             : -
+Description     : Payment transaction outcome. Values: INITIATED (attempt
+                  started), SUCCESS (payment confirmed), FAILED (transaction
+                  declined or timed out), REFUNDED (payment reversed
+                  post-return approval). Use pmt_sts_cd = 'SUCCESS' for
+                  confirmed revenue; include REFUNDED rows for net revenue.
+
+Column          : pmt_amt
+Data Type       : DECIMAL(12,2)
+Nullable        : NOT NULL
+Key             : -
+Description     : Amount processed in this transaction in INR. For
+                  split-payment sessions, the sum of SUCCESS rows equals
+                  the total order value.
+
+Column          : pmt_dt_utc
+Data Type       : TIMESTAMP
+Nullable        : NOT NULL
+Key             : -
+Description     : UTC timestamp of this payment transaction attempt. Use
+                  for payment timing analysis and SLA measurement against
+                  checkout_sessions.sess_strt_dt_utc.
+
+
+================================================================================
+TABLE: returns
+================================================================================
+
+SEMANTIC DESCRIPTION
+--------------------
+Records every return request raised by a customer against a delivered order.
+Parent to return_items. Each row represents a single return request header which
+may cover one or multiple items from the original order. The return lifecycle
+flows from REQUESTED through APPROVED or REJECTED, then RECEIVED (physical item
+back at warehouse), and finally REFUNDED. Only REFUNDED status rows represent a
+completed financial reversal and should be included in net revenue and refund
+rate calculations. rtn_rsn_cd is the primary dimension for returns analytics
+used by the Catalogue and Quality teams to identify defective products, supplier
+issues, and listing accuracy problems. A return may only be raised against an
+order in DELIVERED status — enforced by the order management system at creation.
+
+UPSTREAM DEPENDENCIES: orders, customers
+DOWNSTREAM CONSUMERS:  return_items, net revenue dbt models,
+                       returns analytics dashboards,
+                       product quality alerting pipeline,
+                       warehouse disposition workflow
+
+GRAIN: One row per return request. One order may have multiple return requests
+if items are returned in separate batches.
+
+COLUMN DEFINITIONS
+------------------
+Column          : rtn_id
+Data Type       : UUID
+Nullable        : NOT NULL
+Key             : PRIMARY KEY
+Description     : System-generated unique identifier for this return request.
+                  Referenced by return_items as the parent entity.
+
+Column          : ord_id
+Data Type       : UUID
+Nullable        : NOT NULL
+Key             : FOREIGN KEY -> orders.ord_id
+Description     : The original order against which this return is raised.
+                  The referenced order must be in DELIVERED status. One
+                  order may have multiple return requests if items are
+                  returned in separate batches.
+
+Column          : cust_ref_id
+Data Type       : UUID
+Nullable        : NOT NULL
+Key             : FOREIGN KEY -> customers.cust_id
+Description     : Customer who raised the return request. Denormalised from
+                  the parent order for direct customer-level return rate
+                  queries without requiring an orders join.
+
+Column          : rtn_sts_cd
+Data Type       : VARCHAR(20)
+Nullable        : NOT NULL
+Key             : -
+Description     : Return lifecycle status. Values: REQUESTED (submitted by
+                  customer), APPROVED (accepted by ops team), REJECTED
+                  (declined), RECEIVED (item back at warehouse), REFUNDED
+                  (refund processed to original payment method). Include
+                  only REFUNDED rows in net revenue calculations.
+
+Column          : rtn_req_dt_utc
+Data Type       : TIMESTAMP
+Nullable        : NOT NULL
+Key             : -
+Description     : UTC timestamp when the customer submitted the return
+                  request. Use for return rate time-series and SLA
+                  breach analysis.
+
+Column          : rtn_rsn_cd
+Data Type       : VARCHAR(30)
+Nullable        : NOT NULL
+Key             : -
+Description     : Customer-stated reason for return. Values: DEFECTIVE
+                  (product fault), WRONG_ITEM (incorrect item dispatched),
+                  NOT_AS_DESC (product does not match listing),
+                  CHANGED_MIND (customer preference),
+                  DAMAGED_TRANSIT (damaged during delivery). Primary
+                  dimension for returns root cause analysis.
+
+
+================================================================================
+TABLE: return_items
+================================================================================
+
+SEMANTIC DESCRIPTION
+--------------------
+The return line-item table storing one row per product per return request.
+Child of returns. Maintains a direct foreign key to order_items via ord_itm_id
+ensuring full traceability from refund back to the original order line, enabling
+precise net revenue and return rate calculations at the SKU level. rtn_qty_num
+must always be less than or equal to qty_ord_num on the referenced order_items
+row — enforced by the order management system but should be validated in
+analytical pipelines. itm_cnd_cd is used by warehouse operations to determine
+whether a returned item can be restocked, refurbished, or written off. rfnd_amt
+is the approved refund for this specific line and may be less than the original
+line value if a partial refund policy applies (e.g. CHANGED_MIND returns beyond
+the 7-day window). rfnd_amt is NULL until the return is APPROVED.
+
+UPSTREAM DEPENDENCIES: returns, order_items
+DOWNSTREAM CONSUMERS:  SKU-level return rate dbt models,
+                       net revenue reconciliation,
+                       warehouse disposition workflow,
+                       supplier chargeback pipeline
+
+GRAIN: One row per product per return request.
+
+COLUMN DEFINITIONS
+------------------
+Column          : rtn_itm_id
+Data Type       : UUID
+Nullable        : NOT NULL
+Key             : PRIMARY KEY
+Description     : System-generated unique identifier for this return
+                  line item.
+
+Column          : rtn_id
+Data Type       : UUID
+Nullable        : NOT NULL
+Key             : FOREIGN KEY -> returns.rtn_id
+Description     : Parent return request this line belongs to. Every
+                  return_items row must have a valid returns parent.
+
+Column          : ord_itm_id
+Data Type       : UUID
+Nullable        : NOT NULL
+Key             : FOREIGN KEY -> order_items.ord_itm_id
+Description     : The original order line being returned. Enables direct
+                  SKU-level return rate calculation and net revenue
+                  reconciliation without traversing the full orders
+                  join path.
+
+Column          : rtn_qty_num
+Data Type       : INT
+Nullable        : NOT NULL
+Key             : -
+Description     : Quantity of this product being returned. Must be greater
+                  than 0 and less than or equal to qty_ord_num on the
+                  referenced order_items row. Partial quantity returns
+                  are permitted.
+
+Column          : itm_cnd_cd
+Data Type       : VARCHAR(20)
+Nullable        : NOT NULL
+Key             : -
+Description     : Physical condition of the returned item as assessed by
+                  the warehouse team on receipt. Values: SEALED (unopened,
+                  eligible for immediate restock), OPENED (used but intact,
+                  eligible for refurbishment), DAMAGED (physically damaged,
+                  write-off candidate), MISSING_PARTS (incomplete, requires
+                  assessment). Drives warehouse disposition workflow.
+
+Column          : rfnd_amt
+Data Type       : DECIMAL(10,2)
+Nullable        : NULL
+Key             : -
+Description     : Approved refund amount in INR for this return line. Set
+                  by the Returns ops team on APPROVED status transition.
+                  NULL until approval decision is made. May be less than
+                  original line value for partial refund policies. Aggregate
+                  across REFUNDED-status return_items rows for total refund
+                  liability.
+
+
+================================================================================
+RELATIONSHIP SUMMARY
+================================================================================
+
+Parent-Child Hierarchy
+----------------------
+product_categories  (self-referencing: par_cat_cd -> cat_cd)
+  └── products                        (cat_cd -> product_categories.cat_cd)
+        └── product_inventory         (prd_id -> products.prd_id)
+
+customers
+  ├── orders                          (cust_ref_id -> customers.cust_id)
+  │     └── order_items               (ord_id -> orders.ord_id)
+  └── checkout_sessions               (cust_ref_id -> customers.cust_id)
+              └── payments            (sess_id -> checkout_sessions.sess_id)
+
+orders
+  └── returns                         (ord_id -> orders.ord_id)
+          └── return_items            (rtn_id -> returns.rtn_id)
+
+order_items <── return_items          (ord_itm_id -> order_items.ord_itm_id)
+checkout_sessions <── orders          (ord_id -> checkout_sessions.ord_id)
+
+
+Primary Analytics Join Paths
+-----------------------------
+Revenue analysis:
+  customers -> orders -> order_items -> products -> product_categories
+
+Conversion funnel:
+  customers -> checkout_sessions -> payments
+
+Returns and refunds:
+  orders -> returns -> return_items -> order_items -> products
+
+Channel and regional mix:
+  orders (chnl_cd) + customers (cust_rgn_cd)
+
+Customer lifetime value:
+  customers (cust_tier_cd) -> orders -> order_items
+
+
+Critical Mandatory Filters (apply to every analytics query)
+------------------------------------------------------------
+1. customers.is_tst_acct_flg = FALSE
+   Exclude test and QA accounts from all revenue, order count,
+   and ML training queries. Most common source of metric inflation.
+
+2. orders.ord_sts_cd NOT IN ('PENDING', 'CANCELLED')
+   Use only CONFIRMED, SHIPPED, or DELIVERED orders for revenue.
+
+3. products.prd_sts_cd = 'A' (or include 'S' for seasonal)
+   Filter to active products for availability and catalogue queries.
+
+4. payments.pmt_sts_cd = 'SUCCESS' (or include 'REFUNDED' for net)
+   Only confirmed payments contribute to revenue. FAILED rows must
+   be excluded from financial reporting.
+
+5. returns.rtn_sts_cd = 'REFUNDED'
+   Only completed refunds are included in net revenue calculations.
+
+6. product_categories.cat_lvl_num = 3
+   Filter to leaf-level categories when joining products to categories
+   for classification queries.
+
+
+Revenue Calculation Reference
+------------------------------
+Gross order value (order level):
+  SUM(orders.tot_ord_amt) WHERE ord_sts_cd IN ('CONFIRMED','SHIPPED','DELIVERED')
+
+Net line revenue:
+  SUM(order_items.unit_sell_prc_amt * qty_ord_num * (1 - disc_pct / 100))
+
+Total refunds:
+  SUM(return_items.rfnd_amt) WHERE returns.rtn_sts_cd = 'REFUNDED'
+
+Net revenue:
+  Gross order value - Total refunds
+
+Available-to-promise inventory:
+  SUM(product_inventory.qty_on_hnd_num - qty_rsv_num) WHERE result > 0
+
+Checkout conversion rate:
+  COUNT(sess_sts_cd = 'COMPLETED') /
+  COUNT(sess_sts_cd IN ('COMPLETED','ABANDONED'))
+
+
+================================================================================
+END OF DOCUMENT
+================================================================================
